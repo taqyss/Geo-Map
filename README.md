@@ -39,9 +39,6 @@ run_pipeline.py
 | `run_pipeline.py` | Orchestrates the full pipeline: CV processing → LLM report → Telegram reply. |
 | `geomap_cv.py` | Standalone CV script. Can be run directly on any image (`python geomap_cv.py <image>`) for testing without Telegram. |
 | `SKILL.md` | System prompt / instructions for the LLM report-generation step. Defines the report format, classification rules, and ethical boundaries (e.g. no political claims on contested borders). |
-| `requirements.txt` | Python dependencies. |
-| `.gitignore` | Excludes secrets, generated files, and received images from version control. |
-| `config.py` (you create this) | Holds API keys/tokens — see Setup below. |
 
 ## Setup
 
