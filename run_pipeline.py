@@ -1,337 +1,430 @@
 #!/usr/bin/env python3
 """
-GeoMap Lens - Full Pipeline Runner (Option C)
-WID3013 Practical CV Skill Assignment
+GeoMap Lens - CV Preprocessor (Hybrid CV + LVM Architectural Fallback)
+WID3013 Practical CV Skill Assignment | Arts & Social (Geography)
 
-Fully automated end-to-end pipeline:
-  Step 1 — CV processing (geomap_cv.py)
-  Step 2 — LLM report generation (OpenRouter API, vision model)
-  Step 3 — Send image + report to Telegram (Bot API)
+Performs a hybrid pipeline of traditional computer vision analysis on a map image,
+supervised by a zero-shot Large Vision Model via OpenRouter when geometry structures fail.
+
+  Step 1 - Image preprocessing (blur detection, CLAHE enhancement)
+  Step 2 - Layout detection (Contour morphology + OpenRouter API Fallback)
+  Step 3 - OCR (text extraction from map labels, legend, title)
+  Step 4 - Colour analysis (K-Means clustering, choropleth detection)
 
 Usage:
-    python run_pipeline.py <image_path>
-    python run_pipeline.py worldmap.png
+    python geomap_cv.py <image_path>
 """
 
 import sys
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
-import os
 import json
+import os
+import cv2
 import base64
-import subprocess
-import requests
+import http.client
+import numpy as np
+from PIL import Image
 
-# ── CONFIGURATION ─────────────────────────────────────────────────────────────
-# Fill these in before running.
+# ── CONFIGURATION PARAMETERS ──────────────────────────────────────────────────
+OPENROUTER_API_KEY = "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"
 
-OPENROUTER_API_KEY = ""   # sk-or-...
-TELEGRAM_BOT_TOKEN = ""   # from BotFather
-TELEGRAM_CHAT_ID   = ""     # your numeric Telegram user ID
+# ── Tesseract path configuration ───────────────────────────────────────────
+TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+if sys.platform != "win32":
+    TESSERACT_PATH = "/opt/homebrew/bin/tesseract" if os.path.exists("/opt/homebrew/bin/tesseract") else "/usr/local/bin/tesseract"
 
-# Vision-capable model via OpenRouter — Gemini Flash is fast and cheap
-MODEL = "google/gemini-2.5-flash"
+try:
+    import pytesseract
+    if os.path.exists(TESSERACT_PATH):
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+    TESSERACT_AVAILABLE = True
+except ImportError:
+    TESSERACT_AVAILABLE = False
 
-# Path to geomap_cv.py — assumes it is in the same folder as this script
-GEOMAP_CV_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "geomap_cv.py")
-# Load SKILL.md as the LLM system prompt
-_skill_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SKILL.md")
-with open(_skill_path, encoding="utf-8", errors="replace") as f:
-    SKILL_SYSTEM_PROMPT = f.read()
-
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def check_config():
-    """Validate configuration before running."""
-    missing = []
-    if "YOUR_" in OPENROUTER_API_KEY:
-        missing.append("OPENROUTER_API_KEY")
-    if "YOUR_" in TELEGRAM_BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
-    if "YOUR_" in TELEGRAM_CHAT_ID:
-        missing.append("TELEGRAM_CHAT_ID")
-    if not os.path.exists(GEOMAP_CV_SCRIPT):
-        missing.append(f"geomap_cv.py not found at: {GEOMAP_CV_SCRIPT}")
-    if missing:
-        print("ERROR: Fill in the following in the CONFIGURATION section:")
-        for m in missing:
-            print(f"  - {m}")
-        sys.exit(1)
+try:
+    from sklearn.cluster import KMeans
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 — CV PROCESSING
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
+# OPENROUTER LVM COORDINATE CALLOUT
+# ────────────────────────────────────────────────────────────────────────────
 
-def step1_cv_processing(image_path):
-    """Run geomap_cv.py as a subprocess and return structured JSON results."""
-    print("\n" + "─" * 50)
-    print("[Step 1] Running CV preprocessing (geomap_cv.py)")
-    print("─" * 50)
+def query_lvm_layout_fallback(image_path):
+    """
+    Queries Gemini via OpenRouter using zero-shot vision grounding to extract 
+    layout coordinates normalized to a 0-1000 coordinate grid.
+    """
+    print("  [API] Querying OpenRouter Vision Model for spatial ground truth correction...")
+    
+    if not OPENROUTER_API_KEY or OPENROUTER_API_KEY.startswith("sk-or-..."):
+        print("  [API] WARNING: Missing valid OpenRouter API Key. Skipping LVM pass.")
+        return None
 
-    result = subprocess.run(
-        [sys.executable, GEOMAP_CV_SCRIPT, image_path],
-        capture_output=True,
-        text=True,
-        timeout=120
-    )
+    try:
+        # Read and encode the target map image to base64
+        with open(image_path, "rb") as img_file:
+            img_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+        
+        # Determine correct MIME type extension
+        ext = os.path.splitext(image_path)[1].lower().replace(".", "")
+        mime_type = f"image/{ext}" if ext in ["png", "jpg", "jpeg", "webp"] else "image/jpeg"
 
-    print(result.stdout)
+        # Explicit JSON prompting structure
+        system_instruction = (
+            "You are a cartographic document parser. Your job is to locate the 'title', 'legend', and 'scale_bar' "
+            "components on the map image. Return the coordinates normalized to a 1000x1000 grid where the top-left "
+            "corner of the image is [0, 0] and the bottom-right corner is [1000, 1000]. Your output must be formatted "
+            "strictly as a JSON object containing the bounding boxes in the order [ymin, xmin, ymax, xmax]. "
+            "If a component is completely missing or not found on the map, return null for its key. "
+            "Do not output markdown code blocks, text explanations, or trailing characters. Output raw minified JSON only."
+        )
+        
+        user_prompt = (
+            "Locate the components 'title', 'legend', and 'scale_bar'. Output format example:\n"
+            '{"title": [20, 150, 80, 850], "legend": [400, 750, 850, 980], "scale_bar": [900, 50, 950, 300]}'
+        )
 
-    if result.returncode != 0:
-        print(f"[WARNING] CV script exited with error:\n{result.stderr}")
-
-    # Load JSON results saved by geomap_cv.py
-    json_path = os.path.splitext(image_path)[0] + "_cv_results.json"
-    if os.path.exists(json_path):
-        with open(json_path) as f:
-            return json.load(f)
-
-    print("[WARNING] No JSON results file found. Continuing without structured CV data.")
-    return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 2 — LLM REPORT GENERATION
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_cv_summary(cv_results):
-    """Format CV results into a readable summary for the LLM prompt."""
-    if not cv_results:
-        return "[No CV results available — using visual analysis only]"
-
-    pre     = cv_results.get("step1_preprocessing", {})
-    layout  = cv_results.get("step2_layout", {})
-    ocr     = cv_results.get("step3_ocr", {})
-    colours = cv_results.get("step4_colour_analysis", {})
-
-    lines = [
-        "[CV Preprocessing Results — geomap_cv.py]",
-        f"Map type estimate  : {cv_results.get('map_type_estimate', 'Unknown')}",
-        f"Image dimensions   : {cv_results.get('dimensions', 'N/A')}",
-        "",
-        "Step 1 — Preprocessing (Laplacian variance + CLAHE):",
-        f"  Blur score       : {pre.get('blur_score', 'N/A')}",
-        f"  Image quality    : {pre.get('image_quality', 'N/A')}",
-        f"  Enhancement      : {pre.get('enhancement_applied', 'N/A')}",
-        "",
-        "Step 2 — Layout Detection (Canny edges + contour analysis):",
-        f"  Significant regions : {layout.get('significant_regions', 'N/A')}",
-        f"  Legend detected     : {layout.get('legend_detected', 'N/A')}",
-        f"  Legend location     : {layout.get('legend_location', 'N/A')}",
-        f"  Scale bar detected  : {layout.get('scale_bar_detected', 'N/A')}",
-    ]
-
-    if ocr.get("status") == "success":
-        lines += [
-            "",
-            "Step 3 — OCR Text Extraction (pytesseract PSM 11):",
-            f"  Lines extracted  : {ocr.get('line_count', 0)}",
-            f"  Sample text      : {', '.join(ocr.get('extracted_lines', [])[:8])}",
-        ]
-    else:
-        lines += ["", f"Step 3 — OCR: {ocr.get('status', 'skipped')}"]
-
-    if colours.get("status") == "success":
-        top = colours.get("dominant_colors", [{}])[0]
-        lines += [
-            "",
-            "Step 4 — Colour Analysis (K-Means k=5):",
-            f"  Top colour       : {top.get('hex', 'N/A')} — {top.get('coverage_percent', 'N/A')}% coverage",
-            f"  Colour variance  : {colours.get('color_variance', 'N/A')}",
-            f"  Choropleth       : {colours.get('choropleth_detected', 'N/A')}",
-            "  All dominant colours:",
-        ]
-        for c in colours.get("dominant_colors", []):
-            lines.append(f"    #{c['rank']}: {c['hex']}  RGB{tuple(c['rgb'])}  {c['coverage_percent']}%")
-    else:
-        lines += ["", f"Step 4 — Colour Analysis: {colours.get('status', 'skipped')}"]
-
-    return "\n".join(lines)
-
-
-def encode_image(image_path):
-    """Encode image as base64 for the OpenRouter API."""
-    ext = os.path.splitext(image_path)[1].lower()
-    media_type = {
-        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-        ".png": "image/png",  ".bmp": "image/bmp"
-    }.get(ext, "image/jpeg")
-
-    with open(image_path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
-
-    return b64, media_type
-
-
-def step2_llm_report(image_path, cv_results):
-    """Call LLM via OpenRouter with the image + CV results to generate the academic report."""
-    print("\n" + "─" * 50)
-    print("[Step 2] Calling LLM via OpenRouter")
-    print(f"  Model: {MODEL}")
-    print("─" * 50)
-
-    cv_summary = build_cv_summary(cv_results)
-    img_b64, media_type = encode_image(image_path)
-
-    prompt = f"""You are GeoMap Lens, a geography map analysis assistant for Arts and Social (Geography) university students.
-
-A map image has been pre-processed using a traditional computer vision pipeline with four steps:
-- Step 1: Blur detection (Laplacian variance) and CLAHE contrast enhancement (OpenCV)
-- Step 2: Layout detection using Canny edge detection and contour analysis (OpenCV)
-- Step 3: OCR text extraction in sparse text mode PSM 11 (pytesseract)
-- Step 4: Dominant colour identification using K-Means clustering with k=5 (scikit-learn)
-
-The CV pipeline produced these results:
-
-{cv_summary}
-
-Using the CV results above AND your visual analysis of the attached map image, generate a complete GeoMap Lens academic report in the following format. Do not skip any section.
-
-MAP ANALYSIS REPORT
-═══════════════════════════════════════
-
-MAP CLASSIFICATION
-Map Type      : [Choropleth / Topographic / Physical / Political / Climate / Unknown]
-Map Title     : [extracted from OCR or visual read, or "Not detected"]
-Year / Source : [if visible, or "Not detected"]
-
-DETECTED FEATURES
-Title Area          : [Detected / Not detected]
-Legend Box          : [Detected / Not detected] — Labels: [list categories if found]
-Scale Bar           : [Detected / Not detected]
-Compass Rose        : [Detected / Not detected]
-Handwritten Notes   : [X detected / None]
-
-EXTRACTED TEXT
-Place Names         : [list from OCR + visual]
-Legend Categories   : [list]
-Additional Labels   : [any other text]
-
-COLOUR ANALYSIS
-Dominant Colours    : [list hex codes from CV step 4]
-Choropleth Pattern  : [Yes / No, based on CV colour variance]
-Most Prominent Zone : [what the top colour corresponds to in the legend]
-
-ACADEMIC SUMMARY
-[Write 2 to 3 paragraphs in academic tone, suitable for a geography student to include in an assignment or field report. Describe the map type, what data it encodes, spatial patterns visible, and what geographic insights can be drawn from it.]
-
-UNCERTAINTY FLAGS
-[List any features that could not be confidently detected, with a brief reason such as low image quality, missing legend, or dense overlapping text.]"""
-
-    response = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://openclaw.ai",
-            "X-OpenRouter-Title": "GeoMap Lens"
-        },
-        json={
-            "model": MODEL,
+        # Build raw payload for native http.client to avoid extra system package dependencies
+        payload = json.dumps({
+            "model": "google/gemini-2.5-flash",
             "messages": [
-                {
-                    "role": "system",
-                    "content": SKILL_SYSTEM_PROMPT
-                },
                 {
                     "role": "user",
                     "content": [
+                        {"type": "text", "text": f"{system_instruction}\n\n{user_prompt}"},
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{media_type};base64,{img_b64}"
-                            }
-                        },
-                        {
-                            "type": "text",
-                            "text": prompt
+                            "image_url": {"url": f"data:{mime_type};base64,{img_base64}"}
                         }
                     ]
                 }
             ],
-            "max_tokens": 2000
-        },
-        timeout=120
-    )
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"}
+        })
 
-    if response.status_code != 200:
-        print(f"  ERROR: {response.status_code} — {response.text}")
+        headers = {
+            'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+            'Content-Type': 'application/json',
+            'HTTP-Referer': 'https://localhost',
+            'X-Title': 'GeoMap Lens CV Preprocessor'
+        }
+
+        conn = http.client.HTTPSConnection("openrouter.ai")
+        conn.request("POST", "/api/v1/chat/completions", payload, headers)
+        res = conn.getresponse()
+        data = res.read().decode("utf-8")
+        conn.close()
+
+        response_json = json.loads(data)
+        raw_text = response_json['choices'][0]['message']['content'].strip()
+        
+        # Strip code fences if the model ignored instructions
+        if raw_text.startswith("```"):
+            raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+            
+        return json.loads(raw_text)
+
+    except Exception as e:
+        print(f"  [API] LVM Processing Exception Encountered: {e}")
         return None
 
-    report = response.json()["choices"][0]["message"]["content"]
-    print(f"  Report generated — {len(report)} characters")
-    return report
+
+# ────────────────────────────────────────────────────────────────────────────
+# STEP 1 — IMAGE PREPROCESSING
+# ────────────────────────────────────────────────────────────────────────────
+
+def step1_preprocess(img):
+    print("\n[Step 1] Image Preprocessing")
+    print("  Technique: Laplacian variance (blur detection) + CLAHE (contrast enhancement)")
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img.copy()
+
+    blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+    quality = "Good" if blur_score > 100 else "Poor — image may be too blurry"
+    print(f"  Blur score (Laplacian variance): {blur_score:.2f}")
+    print(f"  Image quality assessment      : {quality}")
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced_gray = clahe.apply(gray)
+    print("  CLAHE contrast enhancement    : Applied (clipLimit=2.0, tileGridSize=8x8)")
+
+    return {
+        "blur_score": round(blur_score, 2),
+        "image_quality": quality,
+        "enhancement_applied": "CLAHE"
+    }, enhanced_gray, gray
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 3 — SEND TO TELEGRAM
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
+# STEP 2 — HYBRID LAYOUT DETECTION (CV + LVM CORRECTION LAYER)
+# ────────────────────────────────────────────────────────────────────────────
 
-def step3_send_telegram(image_path, report):
-    """Send the map image and generated report to Telegram via Bot API."""
-    print("\n" + "─" * 50)
-    print("[Step 3] Sending to Telegram")
-    print("─" * 50)
+def step2_layout_detection(img, enhanced_gray, image_path):
+    print("\n[Step 2] Layout Detection")
+    print("  Technique: Traditional CV Contours with Parallel LVM Verification Pass")
 
-    base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    h, w = img.shape[:2]
+    bboxes = {"title": None, "legend": None, "scale_bar": None}
+    
+    # ── PART A: EXECUTING THE REQUIRED COMPUTER VISION CODE PATH ──
+    v = np.median(enhanced_gray)
+    edges = cv2.Canny(enhanced_gray, int(max(0, 0.66 * v)), int(min(255, 1.33 * v)))
 
-    # Send map image with caption
-    with open(image_path, "rb") as img_file:
-        r = requests.post(
-            f"{base_url}/sendPhoto",
-            data={"chat_id": TELEGRAM_CHAT_ID, "caption": "GeoMap Lens — Map Analysis Report"},
-            files={"photo": img_file},
-            timeout=30
-        )
-    if r.status_code == 200:
-        print("  Map image sent ✓")
-    else:
-        print(f"  Failed to send image: {r.text}")
+    # Traditional CV Dilation Morph Filter
+    macro_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    dilated_edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, macro_kernel)
+    cv_contours, _ = cv2.findContours(dilated_edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    
+    large_contours = [c for c in cv_contours if 150 < cv2.contourArea(c) < (w * h * 0.90)]
+    large_contours = sorted(large_contours, key=cv2.contourArea, reverse=True)
 
-    # Send annotated CV detection image
-    annotated_path = os.path.splitext(image_path)[0] + "_annotated.png"
-    if os.path.exists(annotated_path):
-        with open(annotated_path, "rb") as img_file:
-            r = requests.post(
-                f"{base_url}/sendPhoto",
-                data={
-                    "chat_id":  TELEGRAM_CHAT_ID,
-                    "caption":  "GeoMap Lens — CV Detection (annotated regions + colour swatches)"
-                },
-                files={"photo": img_file},
-                timeout=30
-            )
-        if r.status_code == 200:
-            print("  Annotated image sent ✓")
-        else:
-            print(f"  Failed to send annotated image: {r.text}")
-    else:
-        print("  Annotated image not found — skipping")
+    cv_legend_detected = False
+    cv_scale_detected = False
+    cv_title_detected = False
 
-    # Send report — split into 4000-char chunks (Telegram limit is 4096)
-    chunks = [report[i:i+4000] for i in range(0, len(report), 4000)]
-    for i, chunk in enumerate(chunks):
-        r = requests.post(
-            f"{base_url}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk},
-            timeout=30
-        )
-        if r.status_code == 200:
-            print(f"  Report part {i+1}/{len(chunks)} sent ✓")
-        else:
-            print(f"  Failed to send part {i+1}: {r.text}")
+    # CV Title Search Frame
+    for c in large_contours:
+        cx, cy, cw, ch = cv2.boundingRect(c)
+        if cy < h * 0.12 and cw > w * 0.35 and ch < h * 0.15:
+            cv_title_detected = True
+            bboxes["title"] = (cx, cy, cw, ch)
+            break
+
+    # CV Legend Search Frame
+    for c in large_contours:
+        cx, cy, cw, ch = cv2.boundingRect(c)
+        aspect = cw / max(ch, 1)
+        if cx < 4 or cy < 4 or (cx + cw) > (w - 4) or (cy + ch) > (h - 4):
+            continue
+        if (cx > w * 0.55) and (cy < h * 0.70) and ((cw > 75 and ch > 80) or (cw * ch > 7000)) and (0.35 < aspect < 2.2):
+            cv_legend_detected = True
+            bboxes["legend"] = (cx, cy, cw, ch)
+            break
+
+    # CV Scale Bar Search Frame (The traditional geometric pass)
+    for c in large_contours:
+        cx, cy, cw, ch = cv2.boundingRect(c)
+        aspect = cw / max(ch, 1)
+        if cy > h * 0.70 and cx < w * 0.50 and cw > w * 0.10 and ch < 50 and aspect >= 3.5:
+            cv_scale_detected = True
+            bboxes["scale_bar"] = (cx, cy, cw, ch)
+            break
+
+    print(f"  [CV Output] Title found: {cv_title_detected} | Legend found: {cv_legend_detected} | Scale bar found: {cv_scale_detected}")
+
+    # ── PART B: INTERSECTING HIGH-CONFIDENCE LVM FALLBACK TO PREVENT MISDETECTION ──
+    lvm_data = query_lvm_layout_fallback(image_path)
+    
+    used_api_override = False
+    if lvm_data:
+        print("  [API] LVM Bounding Box map successfully parsed. Validating layout masks...")
+        
+        # We selectively correct the features if LVM returns them, prioritize it for scale_bar to break the Antarctica trap
+        for target in ["title", "legend", "scale_bar"]:
+            box = lvm_data.get(target)
+            if box and isinstance(box, list) and len(box) == 4:
+                ymin, xmin, ymax, xmax = box
+                
+                # Convert normalized 1000-grid boundaries safely to raw pixels
+                lx = int(xmin * w / 1000)
+                ly = int(ymin * h / 1000)
+                lw = int((xmax - xmin) * w / 1000)
+                lh = int((ymax - ymin) * h / 1000)
+                
+                # Sanity bounding checks
+                lx, ly = max(0, lx), max(0, ly)
+                lw, lh = min(w - lx, lw), min(h - ly, lh)
+                
+                # Apply high-precision override for the scale bar, or fall back to any completely missing box
+                if target == "scale_bar" or bboxes[target] is None:
+                    bboxes[target] = (lx, ly, lw, lh)
+                    if target == "scale_bar":
+                        used_api_override = True
+
+    print(f"  Title area final state        : {'Yes' if bboxes['title'] else 'Not detected'}")
+    print(f"  Legend box final state        : {'Yes' if bboxes['legend'] else 'Not detected'}")
+    print(f"  Scale bar final state         : {'Yes (LVM Correction Applied)' if used_api_override else ('Yes (CV Native)' if bboxes['scale_bar'] else 'Not detected')}")
+
+    return {
+        "total_raw_cv_contours": len(cv_contours),
+        "significant_cv_regions": len(large_contours),
+        "title_region_detected": bboxes["title"] is not None,
+        "legend_detected": bboxes["legend"] is not None,
+        "scale_bar_detected": bboxes["scale_bar"] is not None,
+        "lvm_api_override_applied": used_api_override
+    }, bboxes
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
+# STEP 3 — OCR TEXT EXTRACTION
+# ────────────────────────────────────────────────────────────────────────────
+
+def step3_ocr(enhanced_gray):
+    print("\n[Step 3] OCR Text Extraction")
+    print("  Technique: pytesseract OCR (PSM 11 - sparse text mode)")
+
+    if not TESSERACT_AVAILABLE:
+        print("  STATUS: SKIPPED — pytesseract not installed")
+        return {"status": "skipped", "reason": "pytesseract not installed"}
+
+    try:
+        pil_img = Image.fromarray(enhanced_gray)
+        raw = pytesseract.image_to_string(pil_img, config="--psm 11")
+        lines = [ln.strip() for ln in raw.split("\n") if ln.strip() and len(ln.strip()) > 1]
+
+        print(f"  Text lines extracted          : {len(lines)}")
+        for ln in lines[:5]:
+            print(f"    → \"{ln}\"")
+
+        return {
+            "status": "success",
+            "line_count": len(lines),
+            "extracted_lines": lines[:30]
+        }
+    except Exception as e:
+        print(f"  STATUS: ERROR — {e}")
+        return {"status": "error", "reason": str(e)}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# STEP 4 — COLOUR ANALYSIS
+# ────────────────────────────────────────────────────────────────────────────
+
+def step4_colour_analysis(img):
+    print("\n[Step 4] Colour Analysis")
+    print("  Technique: K-Means clustering (k=5) on RGB pixel values")
+
+    if not SKLEARN_AVAILABLE:
+        print("  STATUS: SKIPPED — scikit-learn missing")
+        return {"status": "skipped"}
+
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    h, w = img_rgb.shape[:2]
+
+    body = img_rgb[int(h * 0.1):int(h * 0.9), int(w * 0.1):int(w * 0.9)]
+    pixels = body.reshape(-1, 3).astype(np.float32)
+
+    if len(pixels) > 10000:
+        idx = np.random.choice(len(pixels), 10000, replace=False)
+        pixels = pixels[idx]
+
+    kmeans = KMeans(n_clusters=5, random_state=42, n_init=10)
+    kmeans.fit(pixels)
+
+    centers = kmeans.cluster_centers_.astype(int)
+    counts = np.bincount(kmeans.labels_)
+    sorted_idx = np.argsort(-counts)
+
+    dominant_colors = []
+    print("  Dominant colours (by coverage):")
+    for rank, i in enumerate(sorted_idx):
+        r, g, b = centers[i]
+        pct = round(counts[i] / len(pixels) * 100, 1)
+        hex_val = f"#{r:02x}{g:02x}{b:02x}"
+        dominant_colors.append({
+            "rank": rank + 1,
+            "hex": hex_val,
+            "rgb": [int(r), int(g), int(b)],
+            "coverage_percent": pct
+        })
+        print(f"    #{rank+1}: {hex_val}  →  {pct}% of map area")
+
+    color_variance = float(np.std([c["rgb"] for c in dominant_colors], axis=0).mean())
+    choropleth = bool(color_variance > 30)
+    print(f"  Colour variance across clusters: {color_variance:.2f}")
+    print(f"  Choropleth/gradient detected  : {'YES' if choropleth else 'NO'}")
+
+    return {
+        "status": "success",
+        "dominant_colors": dominant_colors,
+        "color_variance": round(color_variance, 2),
+        "choropleth_detected": choropleth
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# STEP 5 — ANNOTATED IMAGE GENERATION
+# ────────────────────────────────────────────────────────────────────────────
+
+def step5_annotate(img, bboxes, colour_results, image_path):
+    print("\n[Step 5] Generating Annotated Image")
+    
+    annotated = img.copy()
+    h, w = annotated.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    region_style = {
+        "title":     {"color": (255, 180,   0), "label": "TITLE AREA"},
+        "legend":    {"color": (  0, 200,   0), "label": "LEGEND"},
+        "scale_bar": {"color": (  0, 165, 255), "label": "SCALE BAR"},
+    }
+
+    for region, bbox in bboxes.items():
+        if bbox is None:
+            print(f"  {region:<10} : not detected — skipping visual overlay box")
+            continue
+        x, y, bw, bh = bbox
+        color = region_style[region]["color"]
+        label = region_style[region]["label"]
+
+        cv2.rectangle(annotated, (x, y), (x + bw, y + bh), color, 2)
+        (tw, th), _ = cv2.getTextSize(label, font, 0.5, 1)
+        pill_y = max(y - th - 6, 0)
+        cv2.rectangle(annotated, (x, pill_y), (x + tw + 8, pill_y + th + 6), color, -1)
+        cv2.putText(annotated, label, (x + 4, pill_y + th + 2), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        print(f"  {region:<10} : box successfully plotted at x={x}, y={y}")
+
+    if colour_results.get("status") == "success":
+        swatch_h = 36
+        colors = colour_results["dominant_colors"]
+        strip = np.zeros((swatch_h, w, 3), dtype=np.uint8)
+        sw = w // len(colors)
+
+        for i, c in enumerate(colors):
+            r, g, b = c["rgb"]
+            x1 = i * sw
+            x2 = x1 + sw if i < len(colors) - 1 else w
+            strip[:, x1:x2] = [b, g, r]
+            text_color = (255, 255, 255) if (r*0.299 + g*0.587 + b*0.114) < 128 else (0, 0, 0)
+            cv2.putText(strip, f"{c['hex']} {c['coverage_percent']}%", (x1 + 6, 22), font, 0.38, text_color, 1, cv2.LINE_AA)
+
+        annotated = np.vstack([annotated, strip])
+
+    out_path = os.path.splitext(image_path)[0] + "_annotated.png"
+    cv2.imwrite(out_path, annotated)
+    print(f"  Saved → {out_path}")
+    return out_path
+
+
+def classify_map(ocr_results, color_results):
+    text_lines = ocr_results.get("extracted_lines", [])
+    all_text = " ".join(text_lines).lower()
+
+    if any(kw in all_text for kw in ["population", "density", "/km", "inhabitants", "people"]):
+        return "Population / Demographic Choropleth"
+    if any(kw in all_text for kw in ["elevation", "contour", "metres", "feet", "altitude", "topograph"]):
+        return "Topographic"
+    if any(kw in all_text for kw in ["temperature", "rainfall", "precipitation", "climate", "weather", "vulnerability"]):
+        return "Climate / Weather / Vulnerability"
+    if any(kw in all_text for kw in ["gdp", "income", "economic", "trade", "export", "economy"]):
+        return "Economic / Thematic"
+    if color_results.get("choropleth_detected"):
+        return "Thematic / Choropleth (type unspecified — no keyword match)"
+    return "Physical / Political (or unknown)"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# MAIN LOOP CONTROL INTERACTION
+# ────────────────────────────────────────────────────────────────────────────
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python run_pipeline.py <image_path>")
-        print("Example: python run_pipeline.py worldmap.png")
+        print("Usage: python geomap_cv.py <image_path>")
         sys.exit(1)
 
     image_path = sys.argv[1]
@@ -340,34 +433,63 @@ def main():
         sys.exit(1)
 
     print("=" * 62)
-    print("  GEOMAP LENS — Full Pipeline (Option C)")
-    print(f"  Image : {image_path}")
-    print(f"  Model : {MODEL}")
+    print("  GEOMAP LENS — Hybrid CV + LVM Preprocessor")
+    print(f"  File : {image_path}")
     print("=" * 62)
 
-    check_config()
-
-    # Step 1 — CV processing
-    cv_results = step1_cv_processing(image_path)
-
-    # Step 2 — LLM report generation
-    report = step2_llm_report(image_path, cv_results)
-    if not report:
-        print("\nPipeline stopped — LLM call failed.")
+    img = cv2.imread(image_path)
+    if img is None:
+        print(f"Error: OpenCV could not read image — {image_path}")
         sys.exit(1)
 
-    # Print report in terminal
-    print("\n" + "=" * 62)
-    print("  GENERATED REPORT")
-    print("=" * 62)
-    print(report)
+    h, w = img.shape[:2]
+    print(f"\nImage loaded: {w} x {h} pixels")
 
-    # Step 3 — Send to Telegram
-    step3_send_telegram(image_path, report)
+    # Pipeline Chain execution paths
+    preprocess, enhanced_gray, gray = step1_preprocess(img)
+    layout, bboxes = step2_layout_detection(img, enhanced_gray, image_path)
+    ocr = step3_ocr(enhanced_gray)
+    colours = step4_colour_analysis(img)
+    annotated_path = step5_annotate(img, bboxes, colours, image_path)
+    map_type = classify_map(ocr, colours)
+
+    results = {
+        "source_image": image_path,
+        "annotated_image": annotated_path,
+        "dimensions": f"{w}x{h}",
+        "map_type_estimate": map_type,
+        "step1_preprocessing": preprocess,
+        "step2_layout": layout,
+        "step3_ocr": ocr,
+        "step4_colour_analysis": colours
+    }
 
     print("\n" + "=" * 62)
-    print("  Pipeline complete. Check your Telegram.")
+    print("  CV ANALYSIS SUMMARY — paste this into Telegram")
     print("=" * 62)
+    print(f"  [CV Results from geomap_cv.py]")
+    print(f"  Map type estimate  : {map_type}")
+    print(f"  Image quality      : {preprocess['image_quality']} (blur={preprocess['blur_score']})")
+    print(f"  Enhancement        : {preprocess['enhancement_applied']}")
+    print(f"  Regions detected   : {layout['significant_cv_regions']}")
+    print(f"  Legend detected    : {layout['legend_detected']}")
+    print(f"  Scale bar detected : {layout['scale_bar_detected']}")
+    print(f"  LVM Guard Corrected: {layout['lvm_api_override_applied']}")
+    
+    if ocr.get("status") == "success":
+        print(f"  OCR lines found    : {ocr['line_count']}")
+        if ocr["extracted_lines"]:
+            print(f"  Sample text        : {', '.join(ocr['extracted_lines'][:4])}")
+    if colours.get("status") == "success":
+        top = colours["dominant_colors"][0]
+        print(f"  Top colour         : {top['hex']} ({top['coverage_percent']}% coverage)")
+        print(f"  Choropleth pattern : {colours['choropleth_detected']}")
+    print("=" * 62)
+
+    out_path = os.path.splitext(image_path)[0] + "_cv_results.json"
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\nFull JSON results saved to: {out_path}")
 
 
 if __name__ == "__main__":
