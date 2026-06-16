@@ -27,7 +27,7 @@ import numpy as np
 from PIL import Image
 
 # ── CONFIGURATION PARAMETERS ──────────────────────────────────────────────────
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = ""
 
 # ── Tesseract path configuration ───────────────────────────────────────────
 TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
